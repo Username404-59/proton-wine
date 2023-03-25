@@ -1462,7 +1462,7 @@
 @ stdcall SetPrivateObjectSecurity(long ptr ptr ptr long)
 @ stdcall SetPrivateObjectSecurityEx(long ptr ptr long ptr long)
 @ stdcall SetProcessAffinityUpdateMode(long long)
-@ stdcall SetProcessDefaultCpuSets(ptr ptr long)
+# @ stub SetProcessDefaultCpuSets
 @ stdcall SetProcessGroupAffinity(long ptr ptr)
 # @ stub SetProcessInformation
 @ stdcall SetProcessMitigationPolicy(long ptr long)

@@ -245,6 +245,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
             case KeyBasicInformation:
             {
                 KEY_BASIC_INFORMATION keyinfo;
+                fixed_size = (char *)keyinfo.Name - (char *)&keyinfo;
                 keyinfo.LastWriteTime.QuadPart = reply->modif;
                 keyinfo.TitleIndex = 0;
                 keyinfo.NameLength = reply->namelen;
@@ -255,6 +256,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
             case KeyFullInformation:
             {
                 KEY_FULL_INFORMATION keyinfo;
+                fixed_size = (char *)keyinfo.Class - (char *)&keyinfo;
                 keyinfo.LastWriteTime.QuadPart = reply->modif;
                 keyinfo.TitleIndex = 0;
                 keyinfo.ClassLength = wine_server_reply_size(reply);
@@ -272,6 +274,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
             case KeyNodeInformation:
             {
                 KEY_NODE_INFORMATION keyinfo;
+                fixed_size = (char *)keyinfo.Name - (char *)&keyinfo;
                 keyinfo.LastWriteTime.QuadPart = reply->modif;
                 keyinfo.TitleIndex = 0;
                 if (reply->namelen < wine_server_reply_size(reply))
@@ -292,6 +295,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
             case KeyNameInformation:
             {
                 KEY_NAME_INFORMATION keyinfo;
+                fixed_size = (char *)keyinfo.Name - (char *)&keyinfo;
                 keyinfo.NameLength = reply->namelen;
                 memcpy( info, &keyinfo, min( length, fixed_size ) );
                 break;
@@ -300,6 +304,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
             case KeyCachedInformation:
             {
                 KEY_CACHED_INFORMATION keyinfo;
+                fixed_size = sizeof(keyinfo);
                 keyinfo.LastWriteTime.QuadPart = reply->modif;
                 keyinfo.TitleIndex = 0;
                 keyinfo.SubKeys = reply->subkeys;
@@ -316,8 +321,7 @@ static NTSTATUS enumerate_key( HANDLE handle, int index, KEY_INFORMATION_CLASS i
                 break;
             }
             *result_len = fixed_size + reply->total;
-            if (length < fixed_size) ret = STATUS_BUFFER_TOO_SMALL;
-            else if (length < *result_len) ret = STATUS_BUFFER_OVERFLOW;
+            if (length < *result_len) ret = STATUS_BUFFER_OVERFLOW;
         }
     }
     SERVER_END_REQ;

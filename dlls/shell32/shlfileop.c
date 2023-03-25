@@ -1421,11 +1421,7 @@ static int move_files(LPSHFILEOPSTRUCTW lpFileOp, const FILE_LIST *flFrom, const
     }
 
     if (!PathFileExistsW(flTo->feFiles[0].szDirectory))
-    {
-        int ret = SHCreateDirectoryExW(NULL, flTo->feFiles[0].szDirectory, NULL);
-        if (ret)
-            return ret;
-    }
+        return ERROR_CANCELLED;
 
     if (lpFileOp->fFlags & FOF_MULTIDESTFILES)
         mismatched = flFrom->dwNumFiles - flTo->dwNumFiles;

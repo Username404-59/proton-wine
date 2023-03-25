@@ -1,6 +1,5 @@
 EXTLIB    = libgsm.a
 EXTRAINCL = -I$(srcdir)/inc
-EXTRADEFS = -DWAV49
 
 C_SRCS = \
 	src/add.c \

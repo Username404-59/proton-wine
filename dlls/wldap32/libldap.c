@@ -53,14 +53,7 @@ C_ASSERT( sizeof(LDAPSortKeyU) == sizeof(LDAPSortKey) );
 C_ASSERT( sizeof(LDAPVLVInfoU) == sizeof(LDAPVLVInfo) );
 C_ASSERT( sizeof(LDAPAPIInfoU) == sizeof(LDAPAPIInfo) );
 C_ASSERT( sizeof(LDAPAPIFeatureInfoU) == sizeof(LDAPAPIFeatureInfo) );
-
-static struct timeval *convert_timeval(const struct timevalU *tvu, struct timeval *tv)
-{
-    if (!tvu) return NULL;
-    tv->tv_sec = tvu->tv_sec;
-    tv->tv_usec = tvu->tv_usec;
-    return tv;
-}
+C_ASSERT( sizeof(struct timevalU) == sizeof(struct timeval) );
 
 #define WLDAP32_LBER_ERROR  (~0l)
 
@@ -495,9 +488,8 @@ static NTSTATUS wrap_ldap_rename_s( void *args )
 static NTSTATUS wrap_ldap_result( void *args )
 {
     struct ldap_result_params *params = args;
-    struct timeval tv;
     return ldap_result( params->ld, params->msgid, params->all,
-                        convert_timeval(params->timeout, &tv), (LDAPMessage **)params->result );
+                        (struct timeval *)params->timeout, (LDAPMessage **)params->result );
 }
 
 static NTSTATUS wrap_ldap_sasl_bind( void *args )
@@ -563,20 +555,18 @@ static NTSTATUS wrap_ldap_sasl_interactive_bind_s( void *args )
 static NTSTATUS wrap_ldap_search_ext( void *args )
 {
     struct ldap_search_ext_params *params = args;
-    struct timeval tv;
     return ldap_search_ext( params->ld, params->base, params->scope, params->filter, params->attrs,
                             params->attrsonly, (LDAPControl **)params->serverctrls,
-                            (LDAPControl **)params->clientctrls, convert_timeval(params->timeout, &tv),
+                            (LDAPControl **)params->clientctrls, (struct timeval *)params->timeout,
                             params->sizelimit, (int *)params->msg );
 }
 
 static NTSTATUS wrap_ldap_search_ext_s( void *args )
 {
     struct ldap_search_ext_s_params *params = args;
-    struct timeval tv;
     return ldap_search_ext_s( params->ld, params->base, params->scope, params->filter, params->attrs,
                               params->attrsonly, (LDAPControl **)params->serverctrls,
-                              (LDAPControl **)params->clientctrls, convert_timeval(params->timeout, &tv),
+                              (LDAPControl **)params->clientctrls, (struct timeval *)params->timeout,
                               params->sizelimit, (LDAPMessage **)params->result );
 }
 
