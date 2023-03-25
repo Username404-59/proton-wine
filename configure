@@ -1712,6 +1712,7 @@ enable_windows_gaming_input
 enable_windows_globalization
 enable_windows_media_devices
 enable_windows_media_speech
+enable_windows_networking
 enable_windowscodecs
 enable_windowscodecsext
 enable_winealsa_drv
@@ -1741,6 +1742,7 @@ enable_winspool_drv
 enable_winsta
 enable_wintab32
 enable_wintrust
+enable_wintypes
 enable_winusb
 enable_wlanapi
 enable_wlanui
@@ -10584,6 +10586,9 @@ fi
   *)
 
 printf "%s\n" "#define _GNU_SOURCE 1" >>confdefs.h
+
+    test "$ac_cv_sys_file_offset_bits" = 64 &&
+printf "%s\n" "#define _TIME_BITS 64" >>confdefs.h
 
     case $host_cpu in
       *i[3456789]86*)
@@ -19475,6 +19480,34 @@ printf "%s\n" "$ac_cv_cflags__fshort_wchar" >&6; }
 if test "x$ac_cv_cflags__fshort_wchar" = xyes
 then :
   MSVCRTFLAGS="$MSVCRTFLAGS -fshort-wchar"
+fi
+       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether the compiler supports -Wno-format" >&5
+printf %s "checking whether the compiler supports -Wno-format... " >&6; }
+if test ${ac_cv_cflags__Wno_format+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  ac_wine_try_cflags_saved=$CFLAGS
+CFLAGS="$CFLAGS -Wno-format"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+int main(int argc, char **argv) { return 0; }
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_cflags__Wno_format=yes
+else $as_nop
+  ac_cv_cflags__Wno_format=no
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+CFLAGS=$ac_wine_try_cflags_saved
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_cflags__Wno_format" >&5
+printf "%s\n" "$ac_cv_cflags__Wno_format" >&6; }
+if test "x$ac_cv_cflags__Wno_format" = xyes
+then :
+  MSVCRTFLAGS="$MSVCRTFLAGS -Wno-format"
 fi ;;
   esac
 
@@ -22459,6 +22492,7 @@ wine_fn_config_makefile dlls/windows.media.devices enable_windows_media_devices
 wine_fn_config_makefile dlls/windows.media.devices/tests enable_tests
 wine_fn_config_makefile dlls/windows.media.speech enable_windows_media_speech
 wine_fn_config_makefile dlls/windows.media.speech/tests enable_tests
+wine_fn_config_makefile dlls/windows.networking enable_windows_networking
 wine_fn_config_makefile dlls/windowscodecs enable_windowscodecs
 wine_fn_config_makefile dlls/windowscodecs/tests enable_tests
 wine_fn_config_makefile dlls/windowscodecsext enable_windowscodecsext
@@ -22501,6 +22535,7 @@ wine_fn_config_makefile dlls/wintab32 enable_wintab32
 wine_fn_config_makefile dlls/wintab32/tests enable_tests
 wine_fn_config_makefile dlls/wintrust enable_wintrust
 wine_fn_config_makefile dlls/wintrust/tests enable_tests
+wine_fn_config_makefile dlls/wintypes enable_wintypes
 wine_fn_config_makefile dlls/winusb enable_winusb
 wine_fn_config_makefile dlls/wlanapi enable_wlanapi
 wine_fn_config_makefile dlls/wlanapi/tests enable_tests

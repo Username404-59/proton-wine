@@ -208,6 +208,7 @@ static void * const syscalls[] =
     NtLockVirtualMemory,
     NtMakeTemporaryObject,
     NtMapViewOfSection,
+    NtMapViewOfSectionEx,
     NtNotifyChangeDirectoryFile,
     NtNotifyChangeKey,
     NtNotifyChangeMultipleKeys,
@@ -336,6 +337,7 @@ static void * const syscalls[] =
     NtUnlockFile,
     NtUnlockVirtualMemory,
     NtUnmapViewOfSection,
+    NtUnmapViewOfSectionEx,
     NtWaitForAlertByThreadId,
     NtWaitForDebugEvent,
     NtWaitForKeyedEvent,
@@ -1512,6 +1514,36 @@ static inline char *prepend( char *buffer, const char *str, size_t len )
     return memcpy( buffer - len, str, len );
 }
 
+static void notify_gdb_dll_loaded( void *module, const char *unix_path )
+{
+    static void (*wine_gdb_dll_loaded)( const void *module, const char *unix_path );
+    if (!wine_gdb_dll_loaded) wine_gdb_dll_loaded = dlsym( RTLD_DEFAULT, "wine_gdb_dll_loaded" );
+    if (wine_gdb_dll_loaded)
+    {
+        char *real = realpath( unix_path, NULL ), *path = real;
+        if (!strncmp( path, "/run/host", 9 )) path = path + 9;
+        wine_gdb_dll_loaded( module, path );
+        free( real );
+    }
+}
+
+void notify_gdb_native_dll_loaded( void *module, UNICODE_STRING *nt_name )
+{
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING redir;
+    char *unix_path;
+
+    InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, 0 );
+    get_redirect( &attr, &redir );
+
+    if (!nt_to_unix_file_name( &attr, &unix_path, FILE_OPEN ))
+        notify_gdb_dll_loaded( module, unix_path );
+
+    free( redir.Buffer );
+    free( unix_path );
+}
+
+
 /***********************************************************************
  *	open_dll_file
  *
@@ -1562,6 +1594,7 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
     {
         status = virtual_map_builtin_module( mapping, module, size, image_info, machine, prefer_native );
         NtClose( mapping );
+        if (!status) notify_gdb_dll_loaded( *module, name );
     }
     return status;
 }
@@ -1699,6 +1732,7 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, void **module, SIZE_T
 
     if (found_image) status = STATUS_IMAGE_MACHINE_TYPE_MISMATCH;
     WARN( "cannot find builtin library for %s\n", debugstr_us(nt_name) );
+    if (!status) notify_gdb_native_dll_loaded( *module, nt_name );
 done:
     if (status >= 0 && ext)
     {
@@ -1716,17 +1750,15 @@ done:
  * Load the builtin dll if specified by load order configuration.
  * Return STATUS_IMAGE_ALREADY_LOADED if we should keep the native one that we have found.
  */
-NTSTATUS load_builtin( const pe_image_info_t *image_info, WCHAR *filename,
+NTSTATUS load_builtin( const pe_image_info_t *image_info, UNICODE_STRING *nt_name,
                        void **module, SIZE_T *size )
 {
     WORD machine = image_info->machine;  /* request same machine as the native one */
     NTSTATUS status;
-    UNICODE_STRING nt_name;
     SECTION_IMAGE_INFORMATION info;
     enum loadorder loadorder;
 
-    init_unicode_string( &nt_name, filename );
-    loadorder = get_load_order( &nt_name );
+    loadorder = get_load_order( nt_name );
 
     if (loadorder == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
 
@@ -1737,7 +1769,7 @@ NTSTATUS load_builtin( const pe_image_info_t *image_info, WCHAR *filename,
     }
     else if (image_info->image_flags & IMAGE_FLAGS_WineFakeDll)
     {
-        TRACE( "%s is a fake Wine dll\n", debugstr_w(filename) );
+        TRACE( "%s is a fake Wine dll\n", debugstr_us(nt_name) );
         if (loadorder == LO_NATIVE) return STATUS_DLL_NOT_FOUND;
         loadorder = LO_BUILTIN;  /* builtin with no fallback since mapping a fake dll is not useful */
     }
@@ -1748,9 +1780,9 @@ NTSTATUS load_builtin( const pe_image_info_t *image_info, WCHAR *filename,
     case LO_NATIVE_BUILTIN:
         return STATUS_IMAGE_ALREADY_LOADED;
     case LO_BUILTIN:
-        return find_builtin_dll( &nt_name, module, size, &info, machine, FALSE );
+        return find_builtin_dll( nt_name, module, size, &info, machine, FALSE );
     default:
-        status = find_builtin_dll( &nt_name, module, size, &info, machine, (loadorder == LO_DEFAULT) );
+        status = find_builtin_dll( nt_name, module, size, &info, machine, (loadorder == LO_DEFAULT) );
         if (status == STATUS_DLL_NOT_FOUND || status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH)
             return STATUS_IMAGE_ALREADY_LOADED;
         return status;
@@ -2219,6 +2251,50 @@ static void CDECL steamclient_setup_trampolines(HMODULE src_mod, HMODULE tgt_mod
     else steamclient_count++;
 }
 
+static BOOL CDECL debugstr_pc( void *pc, char *buffer, unsigned int size )
+{
+    unsigned int len;
+    char *s = buffer;
+    Dl_info info;
+
+    snprintf( s, size, "%p:", pc );
+    if (!dladdr( pc, &info )) return FALSE;
+
+    s += (len = strlen( s ));
+    size -= len;
+    snprintf( s, size, " %s + %#zx", info.dli_fname, (char *)pc - (char *)info.dli_fbase );
+    if (info.dli_sname)
+    {
+        s += (len = strlen( s ));
+        size -= len;
+        snprintf( s, size, " (%s + %#zx)", info.dli_sname, (char *)pc - (char *)info.dli_saddr );
+    }
+    return TRUE;
+}
+
+const char * CDECL wine_debuginfostr_pc( void *pc )
+{
+    char buffer[256];
+
+    debugstr_pc( pc, buffer, sizeof(buffer) );
+    return __wine_dbg_strdup( buffer );
+}
+
+static BOOL report_native_pc_as_ntdll;
+
+static BOOL CDECL is_pc_in_native_so(void *pc)
+{
+    Dl_info info;
+
+    if (!report_native_pc_as_ntdll || !dladdr( pc, &info )) return FALSE;
+
+    TRACE( "pc %p, module %s.\n", pc, debugstr_a(info.dli_fname) );
+
+    if (strstr( info.dli_fname, ".dll.so")) return FALSE;
+
+    return TRUE;
+}
+
 /***********************************************************************
  *           unix_funcs
  */
@@ -2234,34 +2310,98 @@ static struct unix_funcs unix_funcs =
     steamclient_setup_trampolines,
     set_unix_env,
     write_crash_log,
+    is_pc_in_native_so,
+    debugstr_pc,
 };
 
 BOOL ac_odyssey;
 BOOL fsync_simulate_sched_quantum;
+BOOL alert_simulate_sched_quantum;
+BOOL no_priv_elevation;
+BOOL localsystem_sid;
+BOOL high_dll_addresses;
+BOOL simulate_writecopy;
 
 static void hacks_init(void)
 {
     static const char upc_exe[] = "Ubisoft Game Launcher\\upc.exe";
-    static const char ac_odyssey_exe[] = "ACOdyssey.exe";
-    const char *env_str;
+    const char *env_str, *sgi;
 
-    if (main_argc > 1 && strstr(main_argv[1], ac_odyssey_exe))
-    {
-        ERR("HACK: AC Odyssey sync tweak on.\n");
+
+    env_str = getenv("WINE_SIMULATE_ASYNC_READ");
+    if (env_str)
+        ac_odyssey = !!atoi(env_str);
+    else if (main_argc > 1 && (strstr(main_argv[1], "ACOdyssey.exe") || strstr(main_argv[1], "ImmortalsFenyxRising.exe")))
         ac_odyssey = TRUE;
-        return;
-    }
+
+    if (ac_odyssey)
+        ERR("HACK: AC Odyssey sync tweak on.\n");
+
     env_str = getenv("WINE_FSYNC_SIMULATE_SCHED_QUANTUM");
     if (env_str)
         fsync_simulate_sched_quantum = !!atoi(env_str);
     else if (main_argc > 1)
+    {
         fsync_simulate_sched_quantum = !!strstr(main_argv[1], upc_exe);
+        fsync_simulate_sched_quantum = fsync_simulate_sched_quantum || !!strstr(main_argv[1], "PlanetZoo.exe");
+        fsync_simulate_sched_quantum = fsync_simulate_sched_quantum || !!strstr(main_argv[1], "GTA5.exe");
+    }
     if (fsync_simulate_sched_quantum)
         ERR("HACK: Simulating sched quantum in fsync.\n");
 
-    env_str = getenv("SteamGameId");
-    if (env_str && !strcmp(env_str, "50130"))
+    env_str = getenv("WINE_ALERT_SIMULATE_SCHED_QUANTUM");
+    if (env_str)
+        alert_simulate_sched_quantum = !!atoi(env_str);
+    else if (main_argc > 1)
+    {
+        alert_simulate_sched_quantum = !!strstr(main_argv[1], "GTA5.exe");
+    }
+    if (alert_simulate_sched_quantum)
+        ERR("HACK: Simulating sched quantum in NtWaitForAlertByThreadId.\n");
+
+    sgi = getenv("SteamGameId");
+    if (sgi && (!strcmp(sgi, "50130") || !strcmp(sgi, "202990") || !strcmp(sgi, "212910")))
         setenv("WINESTEAMNOEXEC", "1", 0);
+
+    env_str = getenv("WINE_NO_PRIV_ELEVATION");
+    if (env_str)  no_priv_elevation = atoi(env_str);
+    else if (sgi) no_priv_elevation = !strcmp(sgi, "1584660");
+
+    env_str = getenv("WINE_UNIX_PC_AS_NTDLL");
+    if (env_str)  report_native_pc_as_ntdll = atoi(env_str);
+    else if (sgi) report_native_pc_as_ntdll = !strcmp(sgi, "700330");
+
+#ifdef _WIN64
+    env_str = getenv("WINE_HIGH_DLL_ADDRESSES");
+    if (env_str)  high_dll_addresses = atoi(env_str);
+    else if (sgi) high_dll_addresses = !strcmp(sgi, "1938010");
+    if (high_dll_addresses)
+        ERR("HACK: moving dlls to high addresses.\n");
+#endif
+
+    env_str = getenv("WINE_SIMULATE_WRITECOPY");
+    if (env_str) simulate_writecopy = atoi(env_str);
+    else if (sgi) simulate_writecopy = !strcmp(sgi, "1608730");
+
+    if (main_argc > 1 && strstr(main_argv[1], "MicrosoftEdgeUpdate.exe"))
+    {
+        ERR("HACK: reporting LocalSystem account SID.\n");
+        localsystem_sid = TRUE;
+        return;
+    }
+
+    if (main_argc > 1 && (strstr(main_argv[1], "\\EADesktop.exe") || strstr(main_argv[1], "\\Link2EA.exe")
+        || strstr(main_argv[1], "EA Desktop\\ErrorReporter.exe") || strstr(main_argv[1], "\\EAConnect_microsoft.exe")
+        || strstr(main_argv[1], "\\EALaunchHelper.exe") || strstr(main_argv[1], "\\EACrashReporter.exe")))
+    {
+        ERR("HACK: setting LIBGL_ALWAYS_SOFTWARE.\n");
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+    }
+    if (sgi && !strcmp(sgi, "292030"))
+    {
+        ERR("HACK: setting LIBGL_ALWAYS_SOFTWARE.\n");
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+    }
 }
 
 /***********************************************************************
@@ -2291,7 +2431,7 @@ static void start_main_thread(void)
     if (p___wine_main_wargv) *p___wine_main_wargv = main_wargv;
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
-    init_thread_stack( teb, is_win64 ? 0x7fffffff : 0, 0, 0 );
+    init_thread_stack( teb, 0, 0, 0 );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
     load_ntdll();
     if (main_image_info.Machine != current_machine) load_wow64_ntdll( main_image_info.Machine );

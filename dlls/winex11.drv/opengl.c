@@ -219,26 +219,6 @@ struct wgl_context
     struct list entry;
 };
 
-struct wgl_pbuffer
-{
-    Drawable   drawable;
-    const struct wgl_pixel_format* fmt;
-    int        width;
-    int        height;
-    int*       attribList;
-    int        use_render_texture; /* This is also the internal texture format */
-    int        texture_bind_target;
-    int        texture_bpp;
-    GLint      texture_format;
-    GLuint     texture_target;
-    GLenum     texture_type;
-    GLuint     texture;
-    int        texture_level;
-    GLXContext tmp_context;
-    GLXContext prev_context;
-    struct list entry;
-};
-
 enum dc_gl_type
 {
     DC_GL_NONE,       /* no GL support (pixel format not set yet) */
@@ -279,6 +259,26 @@ struct gl_drawable
     BOOL                           has_fragment_program;
     BOOL                           has_vertex_program;
     LONG                           last_gamma_serial;
+};
+
+struct wgl_pbuffer
+{
+    struct gl_drawable *gl;
+    const struct wgl_pixel_format* fmt;
+    int        width;
+    int        height;
+    int*       attribList;
+    int        use_render_texture; /* This is also the internal texture format */
+    int        texture_bind_target;
+    int        texture_bpp;
+    GLint      texture_format;
+    GLuint     texture_target;
+    GLenum     texture_type;
+    GLuint     texture;
+    int        texture_level;
+    GLXContext tmp_context;
+    GLXContext prev_context;
+    struct list entry;
 };
 
 enum glx_swap_control_method
@@ -481,6 +481,7 @@ static void wglBindFramebuffer( GLenum target, GLuint framebuffer );
 static void wglBindFramebufferEXT( GLenum target, GLuint framebuffer );
 static void wglDrawBuffer( GLenum buffer );
 static void wglReadBuffer( GLenum src );
+static void wglFramebufferTexture2D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level );
 
 /* check if the extension is present in the list */
 static BOOL has_extension( const char *list, const char *ext )
@@ -1327,6 +1328,10 @@ static void release_gl_drawable( struct gl_drawable *gl )
         pglXDestroyPixmap( gdi_display, gl->drawable );
         XFreePixmap( gdi_display, gl->pixmap );
         break;
+    case DC_GL_PBUFFER:
+        TRACE( "destroying pbuffer drawable %lx\n", gl->drawable );
+        pglXDestroyPbuffer( gdi_display, gl->drawable );
+        break;
     default:
         break;
     }
@@ -1396,7 +1401,7 @@ static BOOL set_swap_interval(GLXDrawable drawable, int interval)
         X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
         pglXSwapIntervalEXT(gdi_display, drawable, interval);
         XSync(gdi_display, False);
-        ret = !X11DRV_check_error();
+        ret = !X11DRV_check_error(gdi_display);
         break;
 
     case GLX_SWAP_CONTROL_MESA:
@@ -1657,6 +1662,7 @@ void sync_gl_drawable( HWND hwnd, BOOL known_child )
 
     new_layered_type = get_gl_layered_type( hwnd );
     if (old->type == DC_GL_PIXMAP_WIN || (known_child && old->type == DC_GL_WINDOW)
+        || (!known_child && old->type != DC_GL_WINDOW)
         || old->layered_type != new_layered_type)
     {
         if ((new = create_gl_drawable( hwnd, old->format, known_child, old->mutable_pf )))
@@ -1915,10 +1921,56 @@ static BOOL WINAPI glxdrv_wglCopyContext(struct wgl_context *src, struct wgl_con
 {
     TRACE("%p -> %p mask %#x\n", src, dst, mask);
 
-    pglXCopyContext(gdi_display, src->ctx, dst->ctx, mask);
+    X11DRV_expect_error( gdi_display, GLXErrorHandler, NULL );
+    pglXCopyContext( gdi_display, src->ctx, dst->ctx, mask );
+    XSync( gdi_display, False );
+    if (X11DRV_check_error( gdi_display ))
+    {
+        ERR( "glXCopyContext failed. glXCopyContext() for direct rendering contexts not "
+             "implemented in the host graphics driver?\n" );
+        return FALSE;
+    }
 
-    /* As opposed to wglCopyContext, glXCopyContext doesn't return anything, so hopefully we passed */
     return TRUE;
+}
+
+static int share_all_contexts = -1;
+
+static GLXContext get_common_context( GLXFBConfig fbconfig )
+{
+    static GLXContext common_context;
+
+    if (share_all_contexts == -1)
+    {
+        const char *e = getenv( "WINE_SHARE_ALL_GL_CONTEXTS" );
+        const char *sgi = getenv( "SteamGameId" );
+
+        if (e)
+            share_all_contexts = !!atoi(e);
+        else
+        {
+            share_all_contexts = sgi && (!strcmp( sgi, "232050" ) || !strcmp( sgi, "333420" ));
+            if (!share_all_contexts)
+            {
+                static const WCHAR ea_desktop[] = u"\\EADesktop.exe";
+                WCHAR module[256];
+                DWORD size;
+
+                if ((size = GetModuleFileNameW( NULL, module, ARRAY_SIZE(module) )) && size < ARRAY_SIZE(module)
+                     && size > ARRAY_SIZE(ea_desktop))
+                    share_all_contexts = !lstrcmpW( module + size - (ARRAY_SIZE(ea_desktop) - 1), u"\\EADesktop.exe" );
+            }
+        }
+        if (share_all_contexts)
+            FIXME( "HACK: sharing all the GL contexts.\n" );
+    }
+
+    if (!share_all_contexts) return NULL;
+
+    if (!common_context)
+        common_context = pglXCreateNewContext( gdi_display, fbconfig, GLX_RGBA_TYPE, NULL, TRUE );
+
+    return common_context;
 }
 
 /***********************************************************************
@@ -1939,7 +1991,7 @@ static struct wgl_context * WINAPI glxdrv_wglCreateContext( HDC hdc )
     {
         ret->hdc = hdc;
         ret->fmt = gl->format;
-        ret->ctx = create_glxcontext(gdi_display, ret, NULL);
+        ret->ctx = create_glxcontext(gdi_display, ret, get_common_context( ret->fmt->fbconfig ));
         EnterCriticalSection( &context_section );
         list_add_head( &context_list, &ret->entry );
         LeaveCriticalSection( &context_section );
@@ -2023,6 +2075,8 @@ static PROC WINAPI glxdrv_wglGetProcAddress(LPCSTR lpszProc)
         return (PROC)wglBindFramebuffer;
     if (!strcmp(lpszProc, "glBindFramebufferEXT"))
         return (PROC)wglBindFramebufferEXT;
+    if (!strcmp(lpszProc, "glFramebufferTexture2D"))
+        return (PROC)wglFramebufferTexture2D;
     return pglXGetProcAddressARB((const GLubyte*)lpszProc);
 }
 
@@ -2149,12 +2203,19 @@ static const char *fs_hack_gamma_frag_shader_src =
 "\n"
 "layout(location = 0) out vec4 outColor;\n"
 "\n"
+"vec3 color_from_index(vec3 index)\n"
+"{\n"
+"    ivec3 i = ivec3(index);\n"
+"    return vec3(values[i.r].r, values[i.g].g, values[i.b].b);\n"
+"}\n"
+"\n"
 "void main(void)\n"
 "{\n"
-"    vec4 lookup = texture(tex, texCoord) * 255.0;\n"
-"    outColor.r = values[int(lookup.r)].r;\n"
-"    outColor.g = values[int(lookup.g)].g;\n"
-"    outColor.b = values[int(lookup.b)].b;\n"
+"    vec3 lookup = texture(tex, texCoord).xyz * 255.0;\n"
+"    vec3 lookup1, lookup2;\n"
+"    lookup1 = floor(lookup);\n"
+"    lookup2 = ceil(lookup);\n"
+"    outColor.xyz = mix(color_from_index(lookup1), color_from_index(lookup2), lookup - lookup1);\n"
 "    outColor.a = 1.0;\n"
 "}\n"
 ;
@@ -2254,6 +2315,50 @@ static void fs_hack_setup_gamma_shader( struct wgl_context *ctx, struct gl_drawa
     pglUseProgram( prev_program );
 }
 
+enum fshack_texture_type
+{
+    FSHACK_TEXTURE_COLOUR,
+    FSHACK_TEXTURE_DEPTH,
+    FSHACK_TEXTURE_LAST,
+};
+
+static void gen_texture( struct wgl_context *ctx, GLuint *tex, enum fshack_texture_type type )
+{
+    static const GLuint texture_names[FSHACK_TEXTURE_LAST] =
+    {
+        65535,
+        65536,
+    };
+    static int texture_name_hack = -1;
+    static int once;
+
+    if (ctx->is_core)
+    {
+        opengl_funcs.gl.p_glGenTextures( 1, tex );
+        return;
+    }
+
+    if (texture_name_hack == -1)
+    {
+        const char *sgi = getenv("SteamGameId");
+
+        texture_name_hack = sgi && (!strcmp( sgi, "6020" ) || !strcmp( sgi, "2200" ) || !strcmp( sgi, "2350" ));
+    }
+
+    if (!texture_name_hack || opengl_funcs.gl.p_glIsTexture( texture_names[type] ))
+    {
+        if (texture_name_hack)
+            FIXME( "Texture %u already exists.\n", texture_names[type] );
+        opengl_funcs.gl.p_glGenTextures( 1, tex );
+        return;
+    }
+    /* Star Wars Jedi Knight: Jedi Academy uses texture names without allocating
+     * them with glGenTextures(). Trying to use a texture name which has low chances
+     * to overlap with what games may use. */
+    if (!once++) FIXME( "Using texture name hack.\n" );
+    *tex = texture_names[type];
+}
+
 static void fs_hack_setup_context( struct wgl_context *ctx, struct gl_drawable *gl )
 {
     GLuint prev_draw_fbo, prev_read_fbo, prev_texture, prev_renderbuffer;
@@ -2325,7 +2430,8 @@ static void fs_hack_setup_context( struct wgl_context *ctx, struct gl_drawable *
         fs_hack_get_attachments_config( gl, &attribs, &config );
 
         if (!ctx->fs_hack_color_texture)
-            opengl_funcs.gl.p_glGenTextures( 1, &ctx->fs_hack_color_texture );
+            gen_texture( ctx, &ctx->fs_hack_color_texture, FSHACK_TEXTURE_COLOUR );
+
         opengl_funcs.gl.p_glBindTexture( GL_TEXTURE_2D, ctx->fs_hack_color_texture );
         opengl_funcs.gl.p_glTexImage2D( GL_TEXTURE_2D, 0, config.color_internalformat, width, height,
                 0, config.color_format, config.color_type, NULL);
@@ -2389,7 +2495,8 @@ static void fs_hack_setup_context( struct wgl_context *ctx, struct gl_drawable *
             else
             {
                 if (!ctx->fs_hack_ds_texture)
-                    opengl_funcs.gl.p_glGenTextures( 1, &ctx->fs_hack_ds_texture );
+                    gen_texture( ctx, &ctx->fs_hack_ds_texture, FSHACK_TEXTURE_DEPTH );
+
                 opengl_funcs.gl.p_glBindTexture( GL_TEXTURE_2D, ctx->fs_hack_ds_texture );
                 opengl_funcs.gl.p_glTexImage2D( GL_TEXTURE_2D, 0, config.ds_internalformat, width, height,
                         0, config.ds_format, config.ds_type, NULL);
@@ -2408,12 +2515,25 @@ static void fs_hack_setup_context( struct wgl_context *ctx, struct gl_drawable *
         if (!ctx->has_been_current)
             opengl_funcs.gl.p_glViewport(0, 0, width, height);
 
-        if(!gl->fs_hack_context_set_up)
+        if (!gl->fs_hack_context_set_up)
         {
-            opengl_funcs.gl.p_glClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
-            opengl_funcs.gl.p_glClearDepth( 1.0 );
-            opengl_funcs.gl.p_glClearStencil( 0 );
-            opengl_funcs.gl.p_glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT );
+            if (ctx->has_been_current)
+            {
+                GLbitfield mask = GL_COLOR_BUFFER_BIT;
+
+                if (attribs.depth_size) mask |= GL_DEPTH_BUFFER_BIT;
+                if (attribs.stencil_size) mask |= GL_STENCIL_BUFFER_BIT;
+
+                pglBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+                pglBlitFramebuffer( 0, 0, width, height, 0, 0, width, height, mask, GL_NEAREST );
+            }
+            else
+            {
+                opengl_funcs.gl.p_glClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+                opengl_funcs.gl.p_glClearDepth( 1.0 );
+                opengl_funcs.gl.p_glClearStencil( 0 );
+                opengl_funcs.gl.p_glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT );
+            }
         }
         pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
         pglDrawBuffer( GL_BACK );
@@ -2585,6 +2705,8 @@ static BOOL WINAPI glxdrv_wglShareLists(struct wgl_context *org, struct wgl_cont
      * current or when it hasn't shared display lists before.
      */
 
+    if (share_all_contexts == 1) return TRUE;
+
     if((org->has_been_current && dest->has_been_current) || dest->has_been_current)
     {
         ERR("Could not share display lists, one of the contexts has been current already !\n");
@@ -2665,6 +2787,32 @@ static void wglReadBuffer( GLenum buffer )
         buffer = GL_COLOR_ATTACHMENT0;
     }
     pglReadBuffer( buffer );
+}
+
+static void wglFramebufferTexture2D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level )
+{
+    struct wgl_context *ctx = NtCurrentTeb()->glContext;
+
+    TRACE( "target %#x, attachment %#x, textarget %#x, texture %u, level %u.\n", target, attachment, textarget,
+            texture, level );
+
+    if (ctx->fs_hack)
+    {
+        /* glFramebufferTexture2D should fail for default framebuffer 0.
+         * Let it fail and relay appropriate error instead of breaking fs_hack FBO. */
+        if (ctx->current_read_fbo == ctx->fs_hack_fbo)
+            pglBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+        if (ctx->current_draw_fbo == ctx->fs_hack_fbo)
+            pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
+    }
+    pglFramebufferTexture2D( target, attachment, textarget, texture, level );
+    if (ctx->fs_hack)
+    {
+        if (ctx->current_read_fbo == ctx->fs_hack_fbo)
+            pglBindFramebuffer( GL_READ_FRAMEBUFFER, ctx->fs_hack_fbo );
+        if (ctx->current_draw_fbo == ctx->fs_hack_fbo)
+            pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, ctx->fs_hack_fbo );
+    }
 }
 
 struct fs_hack_gl_state {
@@ -3228,6 +3376,21 @@ static struct wgl_context *X11DRV_wglCreateContextAttribsARB( HDC hdc, struct wg
                 case WGL_CONTEXT_LAYER_PLANE_ARB:
                     break;
                 case WGL_CONTEXT_FLAGS_ARB:
+                    /* HACK: The Last Campfire sometimes uses an
+                     * invalid value for WGL_CONTEXT_FLAGS_ARB, which
+                     * triggers
+                     * https://gitlab.freedesktop.org/xorg/lib/libx11/-/issues/152
+                     * on the Deck. If we see the invalid value we
+                     * directly return an error, so that Wine doesn't
+                     * crash. This hack can be removed once that issue
+                     * is fixed. */
+                    if (attribList[1] == 0x31b3)
+                    {
+                        WARN("return early to avoid triggering a libX11 bug\n");
+                        HeapFree(GetProcessHeap(), 0, ret);
+                        release_gl_drawable(gl);
+                        return NULL;
+                    }
                     pContextAttribList[0] = GLX_CONTEXT_FLAGS_ARB;
                     pContextAttribList[1] = attribList[1];
                     pContextAttribList += 2;
@@ -3259,9 +3422,10 @@ static struct wgl_context *X11DRV_wglCreateContextAttribsARB( HDC hdc, struct wg
         }
 
         X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
-        ret->ctx = create_glxcontext(gdi_display, ret, hShareContext ? hShareContext->ctx : NULL);
+        ret->ctx = create_glxcontext(gdi_display, ret,
+                                     hShareContext ? hShareContext->ctx : get_common_context( ret->fmt->fbconfig ));
         XSync(gdi_display, False);
-        if ((err = X11DRV_check_error()) || !ret->ctx)
+        if ((err = X11DRV_check_error(gdi_display)) || !ret->ctx)
         {
             /* In the future we should convert the GLX error to a win32 one here if needed */
             WARN("Context creation failed (error %#x).\n", err);
@@ -3460,9 +3624,19 @@ static struct wgl_pbuffer *X11DRV_wglCreatePbufferARB( HDC hdc, int iPixelFormat
     }
 
     PUSH1(attribs, None);
-    object->drawable = pglXCreatePbuffer(gdi_display, fmt->fbconfig, attribs);
-    TRACE("new Pbuffer drawable as %lx\n", object->drawable);
-    if (!object->drawable) {
+    if (!(object->gl = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*object->gl) )))
+    {
+        SetLastError(ERROR_NO_SYSTEM_RESOURCES);
+        goto create_failed;
+    }
+    object->gl->type = DC_GL_PBUFFER;
+    object->gl->format = object->fmt;
+    object->gl->ref = 1;
+
+    object->gl->drawable = pglXCreatePbuffer(gdi_display, fmt->fbconfig, attribs);
+    TRACE("new Pbuffer drawable as %p (%lx)\n", object->gl, object->gl->drawable);
+    if (!object->gl->drawable) {
+        HeapFree(GetProcessHeap(), 0, object->gl);
         SetLastError(ERROR_NO_SYSTEM_RESOURCES);
         goto create_failed; /* unexpected error */
     }
@@ -3490,7 +3664,7 @@ static BOOL X11DRV_wglDestroyPbufferARB( struct wgl_pbuffer *object )
     EnterCriticalSection( &context_section );
     list_remove( &object->entry );
     LeaveCriticalSection( &context_section );
-    pglXDestroyPbuffer(gdi_display, object->drawable);
+    release_gl_drawable( object->gl );
     if (object->tmp_context)
         pglXDestroyContext(gdi_display, object->tmp_context);
     HeapFree(GetProcessHeap(), 0, object);
@@ -3505,30 +3679,21 @@ static BOOL X11DRV_wglDestroyPbufferARB( struct wgl_pbuffer *object )
 static HDC X11DRV_wglGetPbufferDCARB( struct wgl_pbuffer *object )
 {
     struct x11drv_escape_set_drawable escape;
-    struct gl_drawable *gl, *prev;
+    struct gl_drawable *prev;
     HDC hdc;
 
     hdc = CreateDCA( "DISPLAY", NULL, NULL, NULL );
     if (!hdc) return 0;
 
-    if (!(gl = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*gl) )))
-    {
-        DeleteDC( hdc );
-        return 0;
-    }
-    gl->type = DC_GL_PBUFFER;
-    gl->drawable = object->drawable;
-    gl->format = object->fmt;
-    gl->ref = 1;
-
     EnterCriticalSection( &context_section );
     if (!XFindContext( gdi_display, (XID)hdc, gl_pbuffer_context, (char **)&prev ))
         release_gl_drawable( prev );
-    XSaveContext( gdi_display, (XID)hdc, gl_pbuffer_context, (char *)gl );
+    grab_gl_drawable( object->gl );
+    XSaveContext( gdi_display, (XID)hdc, gl_pbuffer_context, (char *)object->gl );
     LeaveCriticalSection( &context_section );
 
     escape.code = X11DRV_SET_DRAWABLE;
-    escape.drawable = object->drawable;
+    escape.drawable = object->gl->drawable;
     escape.mode = IncludeInferiors;
     SetRect( &escape.dc_rect, 0, 0, object->width, object->height );
     ExtEscape( hdc, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
@@ -3548,10 +3713,10 @@ static BOOL X11DRV_wglQueryPbufferARB( struct wgl_pbuffer *object, int iAttribut
 
     switch (iAttribute) {
         case WGL_PBUFFER_WIDTH_ARB:
-            pglXQueryDrawable(gdi_display, object->drawable, GLX_WIDTH, (unsigned int*) piValue);
+            pglXQueryDrawable(gdi_display, object->gl->drawable, GLX_WIDTH, (unsigned int*) piValue);
             break;
         case WGL_PBUFFER_HEIGHT_ARB:
-            pglXQueryDrawable(gdi_display, object->drawable, GLX_HEIGHT, (unsigned int*) piValue);
+            pglXQueryDrawable(gdi_display, object->gl->drawable, GLX_HEIGHT, (unsigned int*) piValue);
             break;
 
         case WGL_PBUFFER_LOST_ARB:
@@ -4165,7 +4330,7 @@ static BOOL X11DRV_wglBindTexImageARB( struct wgl_pbuffer *object, int iBuffer )
             FIXME("partial stub!\n");
         }
 
-        TRACE("drawable=%lx, context=%p\n", object->drawable, prev_context);
+        TRACE("drawable=%p (%lx), context=%p\n", object->gl, object->gl->drawable, prev_context);
         if (!object->tmp_context || object->prev_context != prev_context) {
             if (object->tmp_context)
                 pglXDestroyContext(gdi_display, object->tmp_context);
@@ -4176,7 +4341,7 @@ static BOOL X11DRV_wglBindTexImageARB( struct wgl_pbuffer *object, int iBuffer )
         opengl_funcs.gl.p_glGetIntegerv(object->texture_bind_target, &prev_binded_texture);
 
         /* Switch to our pbuffer */
-        pglXMakeCurrent(gdi_display, object->drawable, object->tmp_context);
+        pglXMakeCurrent(gdi_display, object->gl->drawable, object->tmp_context);
 
         /* Make sure that the prev_binded_texture is set as the current texture state isn't shared between contexts.
          * After that copy the pbuffer texture data. */
@@ -4364,11 +4529,6 @@ static void X11DRV_WineGL_LoadExtensions(void)
             register_extension("WGL_ARB_create_context_profile");
     }
 
-    if (has_extension( glxExtensions, "GLX_ARB_fbconfig_float"))
-    {
-        register_extension("WGL_ARB_pixel_format_float");
-        register_extension("WGL_ATI_pixel_format_float");
-    }
 
     register_extension( "WGL_ARB_extensions_string" );
     opengl_funcs.ext.p_wglGetExtensionsStringARB = X11DRV_wglGetExtensionsStringARB;
@@ -4397,6 +4557,12 @@ static void X11DRV_WineGL_LoadExtensions(void)
     opengl_funcs.ext.p_wglChoosePixelFormatARB      = X11DRV_wglChoosePixelFormatARB;
     opengl_funcs.ext.p_wglGetPixelFormatAttribfvARB = X11DRV_wglGetPixelFormatAttribfvARB;
     opengl_funcs.ext.p_wglGetPixelFormatAttribivARB = X11DRV_wglGetPixelFormatAttribivARB;
+
+    if (has_extension( glxExtensions, "GLX_ARB_fbconfig_float"))
+    {
+        register_extension("WGL_ARB_pixel_format_float");
+        register_extension("WGL_ATI_pixel_format_float");
+    }
 
     /* Support WGL_ARB_render_texture when there's support or pbuffer based emulation */
     if (has_extension( glxExtensions, "GLX_ARB_render_texture") ||

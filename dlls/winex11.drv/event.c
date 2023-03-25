@@ -80,8 +80,6 @@ extern BOOL ximInComposeMode;
 #define XEMBED_UNREGISTER_ACCELERATOR 13
 #define XEMBED_ACTIVATE_ACCELERATOR   14
 
-static const WCHAR restore_window_propW[] = {'_','_','W','I','N','E','_','R','E','S','T','O','R','E','_','W','I','N','D','O','W',0};
-
 Bool (*pXGetEventData)( Display *display, XEvent /*XGenericEventCookie*/ *event ) = NULL;
 void (*pXFreeEventData)( Display *display, XEvent /*XGenericEventCookie*/ *event ) = NULL;
 
@@ -151,6 +149,76 @@ static const char * event_names[MAX_EVENT_HANDLERS] =
 };
 
 int xinput2_opcode = 0;
+
+static CRITICAL_SECTION input_cs;
+static CRITICAL_SECTION_DEBUG input_cs_debug =
+{
+    0, 0, &input_cs,
+    { &input_cs_debug.ProcessLocksList, &input_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": input_cs") }
+};
+static CRITICAL_SECTION input_cs = { &input_cs_debug, -1, 0, 0, 0, 0 };
+static CONDITION_VARIABLE input_cond = {0};
+static Display *input_display;
+
+/* wait for the input thread to startup and return the input display */
+static Display *x11drv_input_display(void)
+{
+    if (input_thread_hack && !input_display)
+    {
+        EnterCriticalSection( &input_cs );
+        while (!input_display) SleepConditionVariableCS( &input_cond, &input_cs, INFINITE );
+        LeaveCriticalSection( &input_cs );
+    }
+
+    return input_display;
+}
+
+/* set the input display and notify waiters */
+static void x11drv_set_input_display( Display *display )
+{
+    if (input_display) return;
+
+    EnterCriticalSection( &input_cs );
+    input_display = display;
+    LeaveCriticalSection( &input_cs );
+    WakeAllConditionVariable( &input_cond );
+}
+
+/* add a window to the windows we get input for */
+void x11drv_input_add_window( HWND hwnd, Window window )
+{
+    long mask = KeyPressMask | KeyReleaseMask | KeymapStateMask;
+    Display *display = x11drv_input_display();
+
+    if (!input_thread_hack) return;
+
+    TRACE( "display %p, window %p/%lx\n", display, hwnd, window );
+
+    EnterCriticalSection( &input_cs );
+    XSaveContext( display, window, winContext, (char *)hwnd );
+    LeaveCriticalSection( &input_cs );
+
+    XSelectInput( display, window, mask );
+    XFlush( display );
+}
+
+/* remove a window from the windows we get input for */
+void x11drv_input_remove_window( Window window )
+{
+    Display *display = x11drv_input_display();
+
+    if (!input_thread_hack) return;
+
+    TRACE( "display %p, window %lx\n", display, window );
+
+    XSelectInput( display, window, 0 );
+    XFlush( display );
+
+    EnterCriticalSection( &input_cs );
+    XDeleteContext( display, window, winContext );
+    LeaveCriticalSection( &input_cs );
+}
 
 /* return the name of an X event */
 static const char *dbgstr_event( int type )
@@ -340,6 +408,7 @@ static int try_grab_pointer( Display *display )
         return 0;
 
     XUngrabPointer( display, CurrentTime );
+    XFlush( display );
     return 1;
 }
 
@@ -425,11 +494,13 @@ static inline BOOL call_event_handler( Display *display, XEvent *event )
         return FALSE;  /* no handler, ignore it */
     }
 
+    EnterCriticalSection( &input_cs );
 #ifdef GenericEvent
     if (event->type == GenericEvent) hwnd = 0; else
 #endif
     if (XFindContext( display, event->xany.window, winContext, (char **)&hwnd ) != 0)
         hwnd = 0;  /* not for a registered window */
+    LeaveCriticalSection( &input_cs );
     if (!hwnd && event->xany.window == root_window) hwnd = GetDesktopWindow();
 
     TRACE( "%lu %s for hwnd/window %p/%lx\n",
@@ -446,7 +517,7 @@ static inline BOOL call_event_handler( Display *display, XEvent *event )
 /***********************************************************************
  *           process_events
  */
-static BOOL process_events( Display *display, Bool (*filter)(Display*, XEvent*,XPointer), ULONG_PTR arg )
+static BOOL process_events( Display *display, ULONG_PTR arg )
 {
     XEvent event, prev_event;
     int count = 0;
@@ -461,8 +532,17 @@ static BOOL process_events( Display *display, Bool (*filter)(Display*, XEvent*,X
         steam_keyboard_opened = TRUE;
 
     prev_event.type = 0;
-    while (XCheckIfEvent( display, &event, filter, (char *)arg ))
+    while (XCheckIfEvent( display, &event, filter_event, (char *)arg ))
     {
+        switch (event.type)
+        {
+        case KeyPress:
+        case KeyRelease:
+        case KeymapNotify:
+            if (input_thread_hack && display != x11drv_input_display()) continue;
+            break;
+        }
+
         count++;
         if (overlay_enabled && filter_event( display, &event, (char *)overlay_filter )) continue;
         if (steam_keyboard_opened && filter_event( display, &event, (char *)keyboard_filter )) continue;
@@ -541,12 +621,12 @@ DWORD CDECL X11DRV_MsgWaitForMultipleObjectsEx( DWORD count, const HANDLE *handl
 
     if (data->current_event) mask = 0;  /* don't process nested events */
 
-    if (process_events( data->display, filter_event, mask )) ret = count - 1;
+    if (process_events( data->display, mask )) ret = count - 1;
     else if (count || timeout)
     {
         ret = WaitForMultipleObjectsEx( count, handles, flags & MWMO_WAITALL,
                                         timeout, flags & MWMO_ALERTABLE );
-        if (ret == count - 1) process_events( data->display, filter_event, mask );
+        if (ret == count - 1) process_events( data->display, mask );
     }
     else ret = WAIT_TIMEOUT;
 
@@ -600,7 +680,7 @@ static inline BOOL can_activate_window( HWND hwnd )
 
     if (!(style & WS_VISIBLE)) return FALSE;
     if ((style & (WS_POPUP|WS_CHILD)) == WS_CHILD) return FALSE;
-    if ((style & WS_MINIMIZE) && !GetPropW( hwnd, restore_window_propW )) return FALSE;
+    if (style & WS_MINIMIZE) return FALSE;
     if (GetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return FALSE;
     if (hwnd == GetDesktopWindow()) return FALSE;
     if (GetWindowRect( hwnd, &rect ) && IsRectEmpty( &rect )) return FALSE;
@@ -845,8 +925,18 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
     if (event->mode == NotifyUngrab && wm_is_mutter(event->display))
         Sleep(100);
 
+    if (!try_grab_pointer( event->display ))
+    {
+        /* ask the desktop window to release its grab before trying to get ours */
+        SendMessageW( GetDesktopWindow(), WM_X11DRV_RELEASE_CURSOR, 0, 0 );
+        XSendEvent( event->display, event->window, False, 0, xev );
+        return FALSE;
+    }
+
     /* ask the foreground window to re-apply the current ClipCursor rect */
-    SendMessageW( GetForegroundWindow(), WM_X11DRV_CLIP_CURSOR_REQUEST, 0, 0 );
+    if (!SendMessageTimeoutW( GetForegroundWindow(), WM_X11DRV_CLIP_CURSOR_REQUEST, 0, 0,
+                              SMTO_NOTIMEOUTIFNOTHUNG, 500, NULL ) && GetLastError() == ERROR_TIMEOUT)
+        ERR( "WM_X11DRV_CLIP_CURSOR_REQUEST timed out.\n" );
 
     /* ignore wm specific NotifyUngrab / NotifyGrab events w.r.t focus */
     if (event->mode == NotifyGrab || event->mode == NotifyUngrab) return FALSE;
@@ -866,11 +956,6 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
         if (!hwnd) hwnd = x11drv_thread_data()->last_focus;
         if (hwnd && can_activate_window(hwnd)) set_focus( xev, hwnd, CurrentTime );
         return TRUE;
-    }
-    else if (!try_grab_pointer( event->display ))
-    {
-        XSendEvent( event->display, event->window, False, 0, xev );
-        return FALSE;
     }
 
     SetForegroundWindow( hwnd );
@@ -1053,6 +1138,8 @@ static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event )
 {
     struct x11drv_win_data *data;
 
+    x11drv_input_add_window( hwnd, event->xany.window );
+
     if (event->xany.window == x11drv_thread_data()->clip_window) return TRUE;
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
@@ -1073,6 +1160,7 @@ static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event )
  */
 static BOOL X11DRV_UnmapNotify( HWND hwnd, XEvent *event )
 {
+    x11drv_input_remove_window( event->xany.window );
     return TRUE;
 }
 
@@ -1412,10 +1500,9 @@ static void handle_wm_state_notify( HWND hwnd, XPropertyEvent *event, BOOL updat
             {
                 TRACE( "restoring win %p/%lx\n", data->hwnd, data->whole_window );
                 release_win_data( data );
-                if ((style & (WS_MINIMIZE | WS_VISIBLE)) == (WS_MINIMIZE | WS_VISIBLE) && GetActiveWindow() != hwnd)
-                    SetPropW( hwnd, restore_window_propW, (HANDLE) TRUE );
-                else
-                    SendMessageW( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 );
+                if ((style & (WS_MINIMIZE | WS_VISIBLE)) == (WS_MINIMIZE | WS_VISIBLE))
+                    SetForegroundWindow( hwnd );
+                SendMessageW( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 );
                 return;
             }
             TRACE( "not restoring win %p/%lx style %08x\n", data->hwnd, data->whole_window, style );
@@ -1479,7 +1566,7 @@ static void handle_gamescope_focused_app( XPropertyEvent *event )
     X11DRV_expect_error( event->display, handle_gamescope_focused_app_error, NULL );
     XGetWindowProperty( event->display, DefaultRootWindow( event->display ), x11drv_atom( GAMESCOPE_FOCUSED_APP ),
                         0, ~0UL, False, XA_CARDINAL, &type, &format, &count, &remaining, (unsigned char **)&property );
-    if (X11DRV_check_error()) focused_app_id = app_id;
+    if (X11DRV_check_error( event->display )) focused_app_id = app_id;
     else
     {
         if (!property) focused_app_id = app_id;
@@ -1491,15 +1578,15 @@ static void handle_gamescope_focused_app( XPropertyEvent *event )
     if (steam_keyboard_opened == keyboard_opened) return;
     steam_keyboard_opened = keyboard_opened;
 
-    TRACE( "Got app id %u, focused app %u\n", app_id, focused_app_id );
+    FIXME( "HACK: Got app id %u, focused app %u\n", app_id, focused_app_id );
     if (keyboard_opened)
     {
-        TRACE( "Steam Keyboard is opened, filtering events.\n" );
+        FIXME( "HACK: Steam Keyboard is opened, filtering events.\n" );
         SetEvent( steam_keyboard_event );
     }
     else
     {
-        TRACE( "Steam Keyboard is closed, stopping events filter.\n" );
+        FIXME( "HACK: Steam Keyboard is closed, stopping events filter.\n" );
         ResetEvent( steam_keyboard_event );
     }
 }
@@ -1520,19 +1607,6 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
     if(name){
         TRACE("win %p PropertyNotify atom: %s, state: 0x%x\n", hwnd, name, event->state);
         XFree(name);
-    }
-
-    if (event->atom == x11drv_atom(_NET_WM_BYPASS_COMPOSITOR))
-    {
-        struct x11drv_win_data *data = get_win_data( hwnd );
-        if (!data) return TRUE;
-
-        /* workaround for mutter gitlab bug #676, changing decorations of a
-         * fullscreen and unredirected window freezes the compositing.
-         */
-        if (wm_is_mutter( data->display )) set_wm_hints( data );
-
-        release_win_data( data );
     }
 
     if (event->atom == x11drv_atom(WM_STATE)) handle_wm_state_notify( hwnd, event, TRUE );
@@ -1992,4 +2066,20 @@ static BOOL X11DRV_ClientMessage( HWND hwnd, XEvent *xev )
     }
     TRACE( "no handler found for %ld\n", event->message_type );
     return FALSE;
+}
+
+NTSTATUS x11drv_input_thread( void *arg )
+{
+    struct x11drv_thread_data *data = x11drv_init_thread_data();
+
+    x11drv_set_input_display( data->display );
+
+    for (;;)
+    {
+        XEvent event;
+        XPeekEvent( data->display, &event );
+        process_events( data->display, QS_ALLINPUT );
+    }
+
+    return 0;
 }
