@@ -364,34 +364,11 @@ struct filesystem_event
     char        name[1];
 };
 
-struct luid
+typedef struct
 {
     unsigned int low_part;
     int          high_part;
-};
-
-struct luid_attr
-{
-    struct luid  luid;
-    unsigned int attrs;
-};
-
-struct acl
-{
-    unsigned char  revision;
-    unsigned char  pad1;
-    unsigned short size;
-    unsigned short count;
-    unsigned short pad2;
-};
-
-struct sid
-{
-    unsigned char revision;
-    unsigned char sub_count;
-    unsigned char id_auth[6];
-    unsigned int  sub_auth[15];
-};
+} luid_t;
 
 typedef struct
 {
@@ -436,6 +413,13 @@ struct object_type_info
     unsigned int  handle_max;
     unsigned int  valid_access;
     generic_map_t mapping;
+
+};
+
+struct token_groups
+{
+    unsigned int count;
+
 
 };
 
@@ -831,6 +815,61 @@ typedef struct
     lparam_t info;
 } cursor_pos_t;
 
+struct cpu_topology_override
+{
+    unsigned int cpu_count;
+    unsigned char host_cpu_id[64];
+};
+
+struct shared_cursor
+{
+    int                  x;
+    int                  y;
+    unsigned int         last_change;
+    rectangle_t          clip;
+};
+
+struct desktop_shared_memory
+{
+    unsigned int         seq;
+    struct shared_cursor cursor;
+    unsigned char        keystate[256];
+    thread_id_t          foreground_tid;
+};
+
+struct queue_shared_memory
+{
+    unsigned int         seq;
+    int                  created;
+    unsigned int         wake_bits;
+    unsigned int         changed_bits;
+    unsigned int         wake_mask;
+    unsigned int         changed_mask;
+    thread_id_t          input_tid;
+};
+
+struct input_shared_memory
+{
+    unsigned int         seq;
+    int                  created;
+    thread_id_t          tid;
+    user_handle_t        focus;
+    user_handle_t        capture;
+    user_handle_t        active;
+    user_handle_t        menu_owner;
+    user_handle_t        move_size;
+    user_handle_t        caret;
+    user_handle_t        cursor;
+    rectangle_t          caret_rect;
+    int                  cursor_count;
+    unsigned char        keystate[256];
+    int                  keystate_lock;
+};
+
+
+#define SEQUENCE_MASK_BITS  4
+#define SEQUENCE_MASK ((1UL << SEQUENCE_MASK_BITS) - 1)
+
 
 
 
@@ -928,6 +967,7 @@ struct init_process_done_reply
 {
     struct reply_header __header;
     client_ptr_t entry;
+    /* VARARG(cpu_override,cpu_topology_override); */
     int          suspend;
     char __pad_20[4];
 };
@@ -942,6 +982,8 @@ struct init_first_thread_request
     int          debug_level;
     int          reply_fd;
     int          wait_fd;
+    char         nice_limit;
+    char __pad_33[7];
 };
 struct init_first_thread_reply
 {
@@ -2155,7 +2197,9 @@ struct read_process_memory_request
 struct read_process_memory_reply
 {
     struct reply_header __header;
+    int unix_pid;
     /* VARARG(data,bytes); */
+    char __pad_12[4];
 };
 
 
@@ -2702,10 +2746,10 @@ struct send_hardware_message_reply
     int             prev_y;
     int             new_x;
     int             new_y;
-    /* VARARG(keystate,bytes); */
     char __pad_28[4];
 };
 #define SEND_HWMSG_INJECTED    0x01
+#define SEND_HWMSG_RAWINPUT    0x02
 
 
 
@@ -2731,9 +2775,9 @@ struct get_message_reply
     int             x;
     int             y;
     unsigned int    time;
-    unsigned int    active_hooks;
     data_size_t     total;
     /* VARARG(data,message_data); */
+    char __pad_52[4];
 };
 
 
@@ -3390,6 +3434,19 @@ struct set_window_region_reply
 
 
 
+struct set_layer_region_request
+{
+    struct request_header __header;
+    user_handle_t  window;
+    /* VARARG(region,rectangles); */
+};
+struct set_layer_region_reply
+{
+    struct reply_header __header;
+};
+
+
+
 struct get_update_region_request
 {
     struct request_header __header;
@@ -3785,14 +3842,10 @@ struct get_thread_input_reply
     user_handle_t  focus;
     user_handle_t  capture;
     user_handle_t  active;
-    user_handle_t  foreground;
     user_handle_t  menu_owner;
     user_handle_t  move_size;
     user_handle_t  caret;
-    user_handle_t  cursor;
-    int            show_count;
     rectangle_t    rect;
-    char __pad_60[4];
 };
 
 
@@ -3946,6 +3999,20 @@ enum caret_state
     CARET_STATE_ON,
     CARET_STATE_TOGGLE,
     CARET_STATE_ON_IF_MOVED
+};
+
+
+
+struct get_active_hooks_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_active_hooks_reply
+{
+    struct reply_header __header;
+    unsigned int   active_hooks;
+    char __pad_12[4];
 };
 
 
@@ -4347,13 +4414,13 @@ struct adjust_token_privileges_request
     obj_handle_t  handle;
     int           disable_all;
     int           get_modified_state;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
 };
 struct adjust_token_privileges_reply
 {
     struct reply_header __header;
     unsigned int  len;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
     char __pad_12[4];
 };
 
@@ -4367,7 +4434,7 @@ struct get_token_privileges_reply
 {
     struct reply_header __header;
     unsigned int  len;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
     char __pad_12[4];
 };
 
@@ -4377,14 +4444,14 @@ struct check_token_privileges_request
     struct request_header __header;
     obj_handle_t  handle;
     int           all_required;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
     char __pad_20[4];
 };
 struct check_token_privileges_reply
 {
     struct reply_header __header;
     int           has_privileges;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
     char __pad_12[4];
 };
 
@@ -4411,8 +4478,8 @@ struct filter_token_request
     obj_handle_t  handle;
     unsigned int  flags;
     data_size_t   privileges_size;
-    /* VARARG(privileges,luid_attr,privileges_size); */
-    /* VARARG(disable_sids,sid); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES,privileges_size); */
+    /* VARARG(disable_sids,SID); */
 };
 struct filter_token_reply
 {
@@ -4436,7 +4503,7 @@ struct access_check_reply
     unsigned int    access_granted;
     unsigned int    access_status;
     unsigned int    privileges_len;
-    /* VARARG(privileges,luid_attr); */
+    /* VARARG(privileges,LUID_AND_ATTRIBUTES); */
     char __pad_20[4];
 };
 
@@ -4451,7 +4518,7 @@ struct get_token_sid_reply
 {
     struct reply_header __header;
     data_size_t     sid_len;
-    /* VARARG(sid,sid); */
+    /* VARARG(sid,SID); */
     char __pad_12[4];
 };
 
@@ -4463,10 +4530,9 @@ struct get_token_groups_request
 struct get_token_groups_reply
 {
     struct reply_header __header;
-    data_size_t     attr_len;
-    data_size_t     sid_len;
-    /* VARARG(attrs,uints,attr_len); */
-    /* VARARG(sids,sids); */
+    data_size_t     user_len;
+    /* VARARG(user,token_groups); */
+    char __pad_12[4];
 };
 
 struct get_token_default_dacl_request
@@ -4749,7 +4815,7 @@ struct allocate_locally_unique_id_request
 struct allocate_locally_unique_id_reply
 {
     struct reply_header __header;
-    struct luid    luid;
+    luid_t         luid;
 };
 
 
@@ -4921,8 +4987,8 @@ struct get_token_info_request
 struct get_token_info_reply
 {
     struct reply_header __header;
-    struct luid    token_id;
-    struct luid    modified_id;
+    luid_t         token_id;
+    luid_t         modified_id;
     unsigned int   session_id;
     int            primary;
     int            impersonation_level;
@@ -5002,6 +5068,8 @@ struct remove_completion_request
 {
     struct request_header __header;
     obj_handle_t handle;
+    int          waited;
+    char __pad_20[4];
 };
 struct remove_completion_reply
 {
@@ -5405,7 +5473,6 @@ struct resume_process_reply
 };
 
 
-
 struct get_next_thread_request
 {
     struct request_header __header;
@@ -5419,6 +5486,177 @@ struct get_next_thread_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
+    char __pad_12[4];
+};
+
+enum esync_type
+{
+    ESYNC_SEMAPHORE = 1,
+    ESYNC_AUTO_EVENT,
+    ESYNC_MANUAL_EVENT,
+    ESYNC_MUTEX,
+    ESYNC_AUTO_SERVER,
+    ESYNC_MANUAL_SERVER,
+    ESYNC_QUEUE,
+};
+
+
+struct create_esync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    int          initval;
+    int          type;
+    int          max;
+    /* VARARG(objattr,object_attributes); */
+    char __pad_28[4];
+};
+struct create_esync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int          type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+struct open_esync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    unsigned int attributes;
+    obj_handle_t rootdir;
+    int          type;
+    /* VARARG(name,unicode_str); */
+    char __pad_28[4];
+};
+struct open_esync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int          type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+
+struct get_esync_fd_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_esync_fd_reply
+{
+    struct reply_header __header;
+    int          type;
+    unsigned int shm_idx;
+};
+
+
+struct esync_msgwait_request
+{
+    struct request_header __header;
+    int          in_msgwait;
+};
+struct esync_msgwait_reply
+{
+    struct reply_header __header;
+};
+
+
+struct get_esync_apc_fd_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_esync_apc_fd_reply
+{
+    struct reply_header __header;
+};
+
+enum fsync_type
+{
+    FSYNC_SEMAPHORE = 1,
+    FSYNC_AUTO_EVENT,
+    FSYNC_MANUAL_EVENT,
+    FSYNC_MUTEX,
+    FSYNC_AUTO_SERVER,
+    FSYNC_MANUAL_SERVER,
+    FSYNC_QUEUE,
+};
+
+
+struct create_fsync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    int low;
+    int high;
+    int type;
+    /* VARARG(objattr,object_attributes); */
+    char __pad_28[4];
+};
+struct create_fsync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+
+struct open_fsync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    unsigned int attributes;
+    obj_handle_t rootdir;
+    int          type;
+    /* VARARG(name,unicode_str); */
+    char __pad_28[4];
+};
+struct open_fsync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int          type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+
+struct get_fsync_idx_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_fsync_idx_reply
+{
+    struct reply_header __header;
+    int          type;
+    unsigned int shm_idx;
+};
+
+struct fsync_msgwait_request
+{
+    struct request_header __header;
+    int          in_msgwait;
+};
+struct fsync_msgwait_reply
+{
+    struct reply_header __header;
+};
+
+struct get_fsync_apc_idx_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_fsync_apc_idx_reply
+{
+    struct reply_header __header;
+    unsigned int shm_idx;
     char __pad_12[4];
 };
 
@@ -5574,6 +5812,7 @@ enum request
     REQ_get_surface_region,
     REQ_get_window_region,
     REQ_set_window_region,
+    REQ_set_layer_region,
     REQ_get_update_region,
     REQ_update_window_zorder,
     REQ_redraw_window,
@@ -5608,6 +5847,7 @@ enum request
     REQ_set_capture_window,
     REQ_set_caret_window,
     REQ_set_caret_info,
+    REQ_get_active_hooks,
     REQ_set_hook,
     REQ_remove_hook,
     REQ_start_hook_chain,
@@ -5699,6 +5939,16 @@ enum request
     REQ_suspend_process,
     REQ_resume_process,
     REQ_get_next_thread,
+    REQ_create_esync,
+    REQ_open_esync,
+    REQ_get_esync_fd,
+    REQ_esync_msgwait,
+    REQ_get_esync_apc_fd,
+    REQ_create_fsync,
+    REQ_open_fsync,
+    REQ_get_fsync_idx,
+    REQ_fsync_msgwait,
+    REQ_get_fsync_apc_idx,
     REQ_NB_REQUESTS
 };
 
@@ -5855,6 +6105,7 @@ union generic_request
     struct get_surface_region_request get_surface_region_request;
     struct get_window_region_request get_window_region_request;
     struct set_window_region_request set_window_region_request;
+    struct set_layer_region_request set_layer_region_request;
     struct get_update_region_request get_update_region_request;
     struct update_window_zorder_request update_window_zorder_request;
     struct redraw_window_request redraw_window_request;
@@ -5889,6 +6140,7 @@ union generic_request
     struct set_capture_window_request set_capture_window_request;
     struct set_caret_window_request set_caret_window_request;
     struct set_caret_info_request set_caret_info_request;
+    struct get_active_hooks_request get_active_hooks_request;
     struct set_hook_request set_hook_request;
     struct remove_hook_request remove_hook_request;
     struct start_hook_chain_request start_hook_chain_request;
@@ -5980,6 +6232,16 @@ union generic_request
     struct suspend_process_request suspend_process_request;
     struct resume_process_request resume_process_request;
     struct get_next_thread_request get_next_thread_request;
+    struct create_esync_request create_esync_request;
+    struct open_esync_request open_esync_request;
+    struct get_esync_fd_request get_esync_fd_request;
+    struct esync_msgwait_request esync_msgwait_request;
+    struct get_esync_apc_fd_request get_esync_apc_fd_request;
+    struct create_fsync_request create_fsync_request;
+    struct open_fsync_request open_fsync_request;
+    struct get_fsync_idx_request get_fsync_idx_request;
+    struct fsync_msgwait_request fsync_msgwait_request;
+    struct get_fsync_apc_idx_request get_fsync_apc_idx_request;
 };
 union generic_reply
 {
@@ -6134,6 +6396,7 @@ union generic_reply
     struct get_surface_region_reply get_surface_region_reply;
     struct get_window_region_reply get_window_region_reply;
     struct set_window_region_reply set_window_region_reply;
+    struct set_layer_region_reply set_layer_region_reply;
     struct get_update_region_reply get_update_region_reply;
     struct update_window_zorder_reply update_window_zorder_reply;
     struct redraw_window_reply redraw_window_reply;
@@ -6168,6 +6431,7 @@ union generic_reply
     struct set_capture_window_reply set_capture_window_reply;
     struct set_caret_window_reply set_caret_window_reply;
     struct set_caret_info_reply set_caret_info_reply;
+    struct get_active_hooks_reply get_active_hooks_reply;
     struct set_hook_reply set_hook_reply;
     struct remove_hook_reply remove_hook_reply;
     struct start_hook_chain_reply start_hook_chain_reply;
@@ -6259,11 +6523,21 @@ union generic_reply
     struct suspend_process_reply suspend_process_reply;
     struct resume_process_reply resume_process_reply;
     struct get_next_thread_reply get_next_thread_reply;
+    struct create_esync_reply create_esync_reply;
+    struct open_esync_reply open_esync_reply;
+    struct get_esync_fd_reply get_esync_fd_reply;
+    struct esync_msgwait_reply esync_msgwait_reply;
+    struct get_esync_apc_fd_reply get_esync_apc_fd_reply;
+    struct create_fsync_reply create_fsync_reply;
+    struct open_fsync_reply open_fsync_reply;
+    struct get_fsync_idx_reply get_fsync_idx_reply;
+    struct fsync_msgwait_reply fsync_msgwait_reply;
+    struct get_fsync_apc_idx_reply get_fsync_apc_idx_reply;
 };
 
 /* ### protocol_version begin ### */
 
-#define SERVER_PROTOCOL_VERSION 742
+#define SERVER_PROTOCOL_VERSION 743
 
 /* ### protocol_version end ### */
 
